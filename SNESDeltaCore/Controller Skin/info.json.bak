@@ -3,10 +3,6 @@
   "identifier": "com.delta.snes.standard",
   "gameTypeIdentifier": "com.rileytestut.delta.game.snes",
   "debug": false,
-  "previewImages": {
-    "portrait": "preview_portrait.png",
-    "landscape": "preview_landscape.png"
-  },
   "representations": {
     "iphone": {
       "standard": {
