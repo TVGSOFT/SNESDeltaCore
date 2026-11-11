@@ -16,6 +16,10 @@
 #include "controls.h"
 #include "display.h"
 #include "snes9x/cheats.h"
+#include "fscompat.h"
+#include "conffile.h"
+
+#include <string>
 
 // System
 #include <sys/time.h>
@@ -33,17 +37,20 @@
 
 class ConfigFile;
 
-// snes9x renders into GFX.Screen and assumes it holds SNES_HEIGHT_EXTENDED (239) rows: overscan/PAL
-// frames draw 239 lines, and every save-state load blanks rows up to 239 (snapshot.cpp). DeltaCore's
-// video buffer is only 256x224, so snes9x gets its own full-height screen and each frame's visible
-// rows are copied across. Never point GFX.Screen at the video buffer directly.
-static const size_t SNESScreenPitch = 512; // Bytes per row (256 RGB565 pixels).
-static const size_t SNESVisibleHeight = 224; // Must match SNES.videoFormat.dimensions.height.
-static uint16 *SNESScreenBuffer = NULL;
+// snes9x owns its screen (GFX.ScreenBuffer: 512 px wide, MAX_SNES_HEIGHT rows, GFX.Pitch bytes per row) and
+// writes up to SNES_HEIGHT_EXTENDED (239) rows, on overscan/PAL frames and on every save-state load.
+// DeltaCore's video buffer is only 256x224, so each frame's visible rows are copied across.
+// Never point GFX.Screen at the video buffer directly (Crashlytics eb6827db).
+static const size_t SNESVisibleWidth = 256;  // Must match SNES.videoFormat.dimensions.
+static const size_t SNESVisibleHeight = 224;
 
 @interface SNESEmulatorBridge () <DLTAEmulatorBridging>
 
 @property (nonatomic, copy, nullable, readwrite) NSURL *gameURL;
+
+// YES only between a successful startWithGameURL: and stop. EmulatorCore keeps driving the bridge
+// (frames, saves, save states) even when the ROM failed to load.
+@property (atomic, assign, getter=isGameLoaded) BOOL gameLoaded;
 
 @end
 
@@ -85,7 +92,6 @@ void SNESFinalizeSamplesCallback(void *context);
     Settings.Stereo = YES;
     Settings.SoundPlaybackRate = 32040;
     Settings.SoundInputRate = 32040;
-    Settings.SupportHiRes = NO;
     Settings.Transparency = YES;
     Settings.AutoDisplayMessages = YES;
     Settings.InitialInfoStringTimeout = 120;
@@ -101,6 +107,14 @@ void SNESFinalizeSamplesCallback(void *context);
     Settings.CartAName[0] = 0;
     Settings.CartBName[0] = 0;
     Settings.AutoSaveDelay = 1;
+    // Required by snes9x 1.56+; these are the stock values every frontend sets.
+    Settings.SuperFXClockMultiplier = 100;
+    Settings.InterpolationMethod = DSP_INTERPOLATION_GAUSSIAN;
+    Settings.MaxSpriteTilesPerLine = 34;
+    Settings.OneClockCycle = 6;
+    Settings.OneSlowClockCycle = 8;
+    Settings.TwoClockCycles = 12;
+    Settings.DynamicRateLimit = 5;
     
     S9xSetSoundMute(YES);
     
@@ -111,13 +125,11 @@ void SNESFinalizeSamplesCallback(void *context);
         fprintf(stderr, "Snes9x: Memory allocation failure - not enough RAM/virtual memory available.\nExiting...\n");
         Memory.Deinit();
         S9xDeinitAPU();
-        exit(1);
+        return;
     }
     
     int milliseconds = 16;
-    S9xInitSound(milliseconds, 0);
-    
-    S9xSetRenderPixelFormat(RGB565);
+    S9xInitSound(milliseconds);
     
     S9xUnmapAllControls();
     S9xSetController(0, CTL_JOYPAD, 0, 0, 0, 0);
@@ -150,19 +162,12 @@ void SNESFinalizeSamplesCallback(void *context);
     
     if (!Memory.LoadROM(URL.path.fileSystemRepresentation))
     {
+        // Leave gameLoaded NO: every other bridge call then no-ops instead of running a core with no cart.
         fprintf(stderr, "Error opening the ROM file.\n");
-        exit(1);
+        return;
     }
     
     Settings.StopEmulation = NO;
-    
-    if (SNESScreenBuffer == NULL)
-    {
-        SNESScreenBuffer = (uint16 *)calloc(SNESScreenPitch * SNES_HEIGHT_EXTENDED, 1);
-    }
-    
-    GFX.Pitch = (uint32)SNESScreenPitch;
-    GFX.Screen = SNESScreenBuffer;
     
     S9xGraphicsInit();
     
@@ -171,10 +176,14 @@ void SNESFinalizeSamplesCallback(void *context);
     S9xSetSoundMute(NO);
     
     S9xSetSamplesAvailableCallback(SNESFinalizeSamplesCallback, NULL);
+    
+    self.gameLoaded = YES;
 }
 
 - (void)stop
 {
+    self.gameLoaded = NO;
+    
     S9xGraphicsDeinit();
     Memory.Deinit();
     S9xDeinitAPU();
@@ -200,14 +209,25 @@ void SNESFinalizeSamplesCallback(void *context);
 
 - (void)runFrameAndProcessVideo:(BOOL)processVideo
 {
+    if (![self isGameLoaded])
+    {
+        return;
+    }
+    
     S9xMainLoop();
     
     if (processVideo)
     {
         uint8_t *videoBuffer = self.videoRenderer.videoBuffer;
-        if (videoBuffer != NULL && SNESScreenBuffer != NULL)
+        if (videoBuffer != NULL && GFX.Screen != NULL)
         {
-            memcpy(videoBuffer, SNESScreenBuffer, SNESScreenPitch * SNESVisibleHeight);
+            const size_t rowSize = SNESVisibleWidth * sizeof(uint16);
+            const uint8_t *source = (const uint8_t *)GFX.Screen;
+            
+            for (size_t row = 0; row < SNESVisibleHeight; row++)
+            {
+                memcpy(videoBuffer + row * rowSize, source + row * GFX.Pitch, rowSize);
+            }
         }
         
         [self.videoRenderer processFrame];
@@ -216,7 +236,7 @@ void SNESFinalizeSamplesCallback(void *context);
 
 - (nullable NSData *)readMemoryAtAddress:(NSInteger)address size:(NSInteger)size
 {
-    if (Memory.RAM == NULL)
+    if (![self isGameLoaded] || Memory.RAM == NULL)
     {
         return nil;
     }
@@ -269,9 +289,12 @@ void SNESFinalizeSamplesCallback(void *context);
 
 - (void)renderAudioSamples
 {
-    S9xFinalizeSamples();
-    
     int sampleCount = MIN((int)self.audioRenderer.audioBuffer.availableBytesForWriting / 2, S9xGetSampleCount());
+    
+    if (sampleCount <= 0)
+    {
+        return;
+    }
     
     void *buffer = malloc(sampleCount * 2); // Audio is interleaved, so we multiply by two to account for both channels
     S9xMixSamples((uint8 *)buffer, sampleCount);
@@ -285,11 +308,21 @@ void SNESFinalizeSamplesCallback(void *context);
 
 - (void)saveSaveStateToURL:(NSURL *)URL
 {
+    if (![self isGameLoaded])
+    {
+        return;
+    }
+    
     S9xFreezeGame(URL.path.fileSystemRepresentation);
 }
 
 - (void)loadSaveStateFromURL:(NSURL *)URL
 {
+    if (![self isGameLoaded])
+    {
+        return;
+    }
+    
     S9xUnfreezeGame(URL.path.fileSystemRepresentation);
 }
 
@@ -297,35 +330,44 @@ void SNESFinalizeSamplesCallback(void *context);
 
 - (BOOL)addCheatCode:(NSString *)cheatCode type:(NSString *)type
 {
-    NSArray<NSString *> *codes = [cheatCode componentsSeparatedByString:@"\n"];
-    for (NSString *code in codes)
+    if (![type isEqualToString:CheatTypeGameGenie] && ![type isEqualToString:CheatTypeActionReplay])
     {
-        BOOL success = YES;
-        
-        uint32 address = 0;
-        uint8 byte = 0;
-        
-        if ([type isEqualToString:CheatTypeGameGenie])
+        return NO;
+    }
+    
+    // snes9x parses the code text itself (Game Genie "XXXX-XXXX", Pro Action Replay "AAAAAAVV") and
+    // takes several codes joined with "+" as one group. Validate each line first so a bad line
+    // doesn't leave half a cheat enabled.
+    NSMutableArray<NSString *> *codes = [NSMutableArray array];
+    for (NSString *line in [cheatCode componentsSeparatedByString:@"\n"])
+    {
+        NSString *code = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (code.length == 0)
         {
-            success = (S9xGameGenieToRaw([code UTF8String], address, byte) == NULL);
-        }
-        else if ([type isEqualToString:CheatTypeActionReplay])
-        {
-            success = (S9xProActionReplayToRaw([code UTF8String], address, byte) == NULL);
-        }
-        else
-        {
-            success = NO;
+            continue;
         }
         
-        if (!success)
+        if (S9xCheatValidate(code.UTF8String).empty())
         {
             return NO;
         }
         
-        S9xAddCheat(true, true, address, byte);
+        [codes addObject:code];
     }
-        
+    
+    if (codes.count == 0)
+    {
+        return NO;
+    }
+    
+    int index = S9xAddCheatGroup("", [codes componentsJoinedByString:@"+"].UTF8String);
+    if (index < 0)
+    {
+        return NO;
+    }
+    
+    S9xEnableCheatGroup((uint32_t)index);
+    
     return YES;
 }
 
@@ -337,19 +379,29 @@ void SNESFinalizeSamplesCallback(void *context);
 - (void)updateCheats
 {
     Settings.ApplyCheats = true;
-    S9xApplyCheats();
+    S9xCheatsEnable();
 }
 
 #pragma mark - Game Saves -
 
 - (void)saveGameSaveToURL:(NSURL *)URL
 {
+    if (![self isGameLoaded])
+    {
+        return;
+    }
+    
     Memory.SaveSRAM(URL.path.fileSystemRepresentation);
     sync();
 }
 
 - (void)loadGameSaveFromURL:(NSURL *)URL
 {
+    if (![self isGameLoaded])
+    {
+        return;
+    }
+    
     Memory.LoadSRAM(URL.path.fileSystemRepresentation);
 }
 
@@ -374,70 +426,6 @@ void SNESFinalizeSamplesCallback(void *context)
 
 void S9xSyncSpeed()
 {
-}
-
-void _splitpath(const char *path, char *drive, char *dir, char *fname, char *ext)
-{
-    char *slash = strrchr ((char *) path, SLASH_CHAR);
-    char *dot   = strrchr ((char *) path, '.');
-    
-    *drive = '\0';
-    
-    if (dot && slash && dot < slash)
-    {
-        dot = 0;
-    }
-    
-    if (!slash)
-    {
-        *dir = '\0';
-        strcpy (fname, path);
-        
-        if (dot)
-        {
-            fname[dot - path] = '\0';
-            strcpy (ext, dot + 1);
-        }
-        else
-        {
-            *ext = '\0';
-        }
-    }
-    else
-    {
-        strcpy (dir, path);
-        dir[slash - path] = '\0';
-        strcpy (fname, slash + 1);
-        
-        if (dot)
-        {
-            fname[(dot - slash) - 1] = '\0';
-            strcpy (ext, dot + 1);
-        }
-        else
-        {
-            *ext = '\0';
-        }
-    }
-}
-
-void _makepath(char *path, const char *drive, const char *dir, const char *fname, const char *ext)
-{
-    if (dir && *dir)
-    {
-        strcpy (path, dir);
-        strcat (path, "/");
-    }
-    else
-        *path = '\0';
-    
-    strcat (path, fname);
-    
-    if (ext && *ext)
-    {
-        strcat (path, ".");
-        strcat (path, ext);
-    }
 }
 
 bool8 S9xOpenSnapshotFile(const char *fname, bool8 read_only, STREAM *file)
@@ -495,21 +483,20 @@ void S9xMessage(int type, int number, const char *message)
     printf("%s\n", message);
 }
 
-const char *S9xBasename(const char *path)
-{
-    NSString *filename = [[[SNESEmulatorBridge sharedBridge] gameURL] lastPathComponent];
-    return filename.fileSystemRepresentation;
-}
-
-const char *S9xGetDirectory (enum s9x_getdirtype dirtype)
+std::string S9xGetDirectory(enum s9x_getdirtype dirtype)
 {
     NSURL *directoryURL = [[[SNESEmulatorBridge sharedBridge] gameURL] URLByDeletingLastPathComponent];
-    return directoryURL.path.fileSystemRepresentation;
+    const char *path = directoryURL.path.fileSystemRepresentation;
+    return path ? std::string(path) : std::string();
 }
 
 void S9xAutoSaveSRAM()
 {
-    [SNESEmulatorBridge sharedBridge].saveUpdateHandler();
+    void (^saveUpdateHandler)(void) = [SNESEmulatorBridge sharedBridge].saveUpdateHandler;
+    if (saveUpdateHandler != nil)
+    {
+        saveUpdateHandler();
+    }
 }
 
 bool8 S9xDeinitUpdate(int width, int height)
@@ -517,30 +504,12 @@ bool8 S9xDeinitUpdate(int width, int height)
     return YES;
 }
 
-const char *S9xGetFilename(const char* UTF8Extension, enum s9x_getdirtype dirtype)
+std::string S9xGetFilenameInc(std::string extension, enum s9x_getdirtype dirtype)
 {
-    NSString *extension = [NSString stringWithUTF8String:UTF8Extension];
-    
-    NSURL *fileURL = [[[[SNESEmulatorBridge sharedBridge] gameURL] URLByDeletingPathExtension] URLByAppendingPathExtension:extension];
-    return fileURL.path.fileSystemRepresentation;
-}
-
-const char *S9xGetFilenameInc(const char *UTF8Extension, enum s9x_getdirtype dirtype)
-{
-    return NULL;
+    return std::string();
 }
 
 const char *S9xStringInput(const char* s)
-{
-    return NULL;
-}
-
-const char *S9xChooseFilename(bool8 read_only)
-{
-    return NULL;
-}
-
-const char *S9xChooseMovieFilename(bool8 read_only)
 {
     return NULL;
 }
@@ -551,11 +520,6 @@ bool8 S9xOpenSoundDevice()
 }
 
 bool8 S9xInitUpdate()
-{
-    return YES;
-}
-
-bool8 S9xDoScreenshot(int width, int height)
 {
     return YES;
 }
@@ -591,11 +555,6 @@ void S9xParseArg(char** a, int &b, int c)
 }
 
 void S9xExtraUsage()
-{
-    
-}
-
-void S9xSetPalette()
 {
     
 }
