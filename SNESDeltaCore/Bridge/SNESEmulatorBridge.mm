@@ -33,6 +33,14 @@
 
 class ConfigFile;
 
+// snes9x renders into GFX.Screen and assumes it holds SNES_HEIGHT_EXTENDED (239) rows: overscan/PAL
+// frames draw 239 lines, and every save-state load blanks rows up to 239 (snapshot.cpp). DeltaCore's
+// video buffer is only 256x224, so snes9x gets its own full-height screen and each frame's visible
+// rows are copied across. Never point GFX.Screen at the video buffer directly.
+static const size_t SNESScreenPitch = 512; // Bytes per row (256 RGB565 pixels).
+static const size_t SNESVisibleHeight = 224; // Must match SNES.videoFormat.dimensions.height.
+static uint16 *SNESScreenBuffer = NULL;
+
 @interface SNESEmulatorBridge () <DLTAEmulatorBridging>
 
 @property (nonatomic, copy, nullable, readwrite) NSURL *gameURL;
@@ -148,8 +156,13 @@ void SNESFinalizeSamplesCallback(void *context);
     
     Settings.StopEmulation = NO;
     
-    GFX.Pitch = 512;
-    GFX.Screen = (uint16 *)self.videoRenderer.videoBuffer;
+    if (SNESScreenBuffer == NULL)
+    {
+        SNESScreenBuffer = (uint16 *)calloc(SNESScreenPitch * SNES_HEIGHT_EXTENDED, 1);
+    }
+    
+    GFX.Pitch = (uint32)SNESScreenPitch;
+    GFX.Screen = SNESScreenBuffer;
     
     S9xGraphicsInit();
     
@@ -191,6 +204,12 @@ void SNESFinalizeSamplesCallback(void *context);
     
     if (processVideo)
     {
+        uint8_t *videoBuffer = self.videoRenderer.videoBuffer;
+        if (videoBuffer != NULL && SNESScreenBuffer != NULL)
+        {
+            memcpy(videoBuffer, SNESScreenBuffer, SNESScreenPitch * SNESVisibleHeight);
+        }
+        
         [self.videoRenderer processFrame];
     }
 }
